@@ -126,10 +126,18 @@ typedef struct {
 
 /*
  * IMP first two instructions (prologue):
- *   adrp  x8, #<page>          LE: E8 F8 08 90   (operand bits vary per site,
- *                                                   but this is the exact
- *                                                   encoding at our target)
+ *   adrp  x8, #<page>          e.g. LE: E8 F8 08 90 (8.2) / 08 AB 08 F0 (8.0)
  *   ldrsw x8, [x8, #0x340]     LE: 08 41 83 B9
+ *
+ * The adrp immediate encodes a PC-relative *page* address for the
+ * compiler-generated ivar-offset variable (OBJC_IVAR_$_NSSQLCore.
+ * _sqlCoreFlags). That variable lives at a different address in each
+ * build's __DATA, so the adrp immediate bits differ release to release
+ * even though it's functionally the same instruction (adrp x8, #page).
+ * We verify it by opcode+register only (mask off the immediate), and
+ * verify the ldrsw exactly, since that operand (#0x340, the ivar's byte
+ * offset within the object) is stable as long as the ivar layout is
+ * unchanged.
  *
  * Replacement:
  *   mov w0, #0                  = 0x52800000  LE: 00 00 80 52
@@ -140,15 +148,29 @@ typedef struct {
  * creating/opening a SQLite persistent store.
  */
 
-static const uint8_t EXPECTED[8] = {
-    0xE8, 0xF8, 0x08, 0x90,   /* adrp x8, #<ivar-offset-var page> */
-    0x08, 0x41, 0x83, 0xB9    /* ldrsw x8, [x8, #0x340]            */
-};
+/* ADRP <Xd>, #imm : bit31=1 (op), bits28:24=0b10000, bits4:0=Rd.
+ * immlo (bits30:29) and immhi (bits23:5) are the variable page offset,
+ * so they're masked out. We require Rd == x8. */
+#define ADRP_X8_MASK   0x9F00001Fu
+#define ADRP_X8_VALUE  0x90000008u
+
+/* LDRSW X8, [X8, #0x340] -- fixed, stable across builds */
+#define LDRSW_X8_X8_0x340  0xB9834108u
 
 static const uint8_t PATCHED[8] = {
     0x00, 0x00, 0x80, 0x52,   /* mov w0, #0 */
     0xC0, 0x03, 0x5F, 0xD6    /* ret        */
 };
+
+static int site_matches_original(const uint8_t *site, uint32_t *out_word1)
+{
+    uint32_t word1, word2;
+    memcpy(&word1, site,     4);   /* assumes LE host; fine on x86/arm64 */
+    memcpy(&word2, site + 4, 4);
+    if (out_word1) *out_word1 = word1;
+    return (word1 & ADRP_X8_MASK) == ADRP_X8_VALUE &&
+           word2 == LDRSW_X8_X8_0x340;
+}
 
 /* ── globals ─────────────────────────────────────────────────────────────── */
 
@@ -368,24 +390,28 @@ int main(int argc, char *argv[])
     }
 
     uint8_t *site = g_buf + patch_fo;
+    uint32_t orig_word1 = 0;
 
     printf("[*] Bytes at site: %02X %02X %02X %02X %02X %02X %02X %02X\n",
            site[0], site[1], site[2], site[3],
            site[4], site[5], site[6], site[7]);
-    printf("[*] Expected:      %02X %02X %02X %02X %02X %02X %02X %02X\n",
-           EXPECTED[0], EXPECTED[1], EXPECTED[2], EXPECTED[3],
-           EXPECTED[4], EXPECTED[5], EXPECTED[6], EXPECTED[7]);
 
-    if (memcmp(site, EXPECTED, 8) != 0) {
+    if (!site_matches_original(site, &orig_word1)) {
         fprintf(stderr,
-            "error: unexpected bytes at patch site.\n"
+            "error: unexpected instructions at patch site.\n"
+            "       Expected adrp x8,#<page> ; ldrsw x8,[x8,#0x340] but\n"
+            "       got word1=%#010x word2=%#010x.\n"
             "       Cache may already be patched, wrong version, or the\n"
-            "       compiler generated a different adrp/ldrsw encoding for\n"
-            "       this build. Aborting rather than patching blind.\n");
+            "       ivar layout changed in this build. Aborting rather\n"
+            "       than patching blind.\n",
+            *(uint32_t *)site, *(uint32_t *)(site + 4));
         free(g_buf); return 1;
     }
-    printf("[*] Pre-patch verification passed\n"
-           "[*]   adrp x8,#page + ldrsw x8,[x8,#0x340] confirmed\n");
+    printf("[*] Pre-patch verification passed (adrp x8,#0x%x_page "
+           "+ ldrsw x8,[x8,#0x340] confirmed)\n", orig_word1 & ~ADRP_X8_MASK);
+
+    uint8_t original[8];
+    memcpy(original, site, 8);
 
     memcpy(site, PATCHED, 8);
     printf("[*] Patch applied:\n"
@@ -441,9 +467,13 @@ int main(int argc, char *argv[])
         fprintf(pf, "  Photos.sqlite / -wal / -shm files already created under a protected\n");
         fprintf(pf, "  class still carry that class on-disk and must be deleted so they\n");
         fprintf(pf, "  get recreated unprotected once this patch is loaded.\n\n");
-        fprintf(pf, "ARM64 encoding:\n");
-        fprintf(pf, "  adrp  x8, #page           LE: E8 F8 08 90\n");
-        fprintf(pf, "  ldrsw x8, [x8, #0x340]    LE: 08 41 83 B9\n");
+        fprintf(pf, "ARM64 encoding (this build):\n");
+        fprintf(pf, "  adrp  x8, #page           LE: %02X %02X %02X %02X"
+                    "  (immediate varies per build/link address)\n",
+                original[0], original[1], original[2], original[3]);
+        fprintf(pf, "  ldrsw x8, [x8, #0x340]    LE: %02X %02X %02X %02X"
+                    "  (fixed -- same ivar offset every build)\n",
+                original[4], original[5], original[6], original[7]);
         fprintf(pf, "  mov w0, #0  = MOVZ W0,#0   = 0x52800000  LE: 00 00 80 52\n");
         fprintf(pf, "  ret         = RET           = 0xD65F03C0  LE: C0 03 5F D6\n\n");
         fprintf(pf, "Binary patch:\n");
@@ -454,8 +484,8 @@ int main(int argc, char *argv[])
         fprintf(pf, "  %#010llx   %02X %02X %02X %02X %02X %02X %02X %02X"
                     "   %02X %02X %02X %02X %02X %02X %02X %02X\n\n",
                 (unsigned long long)patch_fo,
-                EXPECTED[0],EXPECTED[1],EXPECTED[2],EXPECTED[3],
-                EXPECTED[4],EXPECTED[5],EXPECTED[6],EXPECTED[7],
+                original[0],original[1],original[2],original[3],
+                original[4],original[5],original[6],original[7],
                 PATCHED[0], PATCHED[1], PATCHED[2], PATCHED[3],
                 PATCHED[4], PATCHED[5], PATCHED[6], PATCHED[7]);
         fprintf(pf, "Pairs well with:\n");
